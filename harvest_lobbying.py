@@ -44,13 +44,27 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
+# The shared gazetteer. Placement used to be each wire's own short country
+# table, which put most of every wire in a counter marked "unplaced"; this is
+# the fleet's common one, and it is optional at import so a harvest still runs
+# if the data file has not been fetched yet.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import galaxy_places
+    _GAZETTEER = True
+except Exception as _exc:                       # noqa: BLE001
+    print("  ! gazetteer unavailable (%s); falling back to the local table"
+          % _exc, file=sys.stderr)
+    galaxy_places = None
+    _GAZETTEER = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCES_PATH = os.path.join(HERE, "sources_lobbying.json")
 OUT_PATH = os.path.join(HERE, "wire_lobbying.json")
 
 RETAIN_DAYS = 45
 MAX_ITEMS = 1200
-WORKERS = 10         # a few hundred wires now
+WORKERS = 14         # ~620 wires now: 26 languages, each asked in its own
 NOTABLE_SCORE = 3       # at or above this a story is marked as consequential
 
 # --------------------------------------------------------------------------
@@ -74,9 +88,24 @@ def build_gnews_url(loc):
     return ("https://news.google.com/rss/search?q=" + urllib.parse.quote(q) +
             "&hl=" + loc["hl"] + "&gl=" + loc["gl"] + "&ceid=" + loc["ceid"])
 
+READ_BUDGET_MIN = 70          # minutes spent reading wires
+
+# The wall-clock budget for reading wires. Past it the remaining sources are
+# recorded unreachable and the harvest finishes on what it has, because the
+# wire is only written at the end of run() and a job killed by the workflow
+# timeout commits nothing at all — which is how a feed gets stuck stale.
+DEADLINE = None
+
+
+def out_of_time():
+    return DEADLINE is not None and time.monotonic() > DEADLINE
+
+
 def fetch(url, tries=3):
     last = None
     for attempt in range(tries):
+        if out_of_time():
+            return None
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": USER_AGENT,
@@ -89,6 +118,16 @@ def fetch(url, tries=3):
                 if resp.headers.get("Content-Encoding") == "gzip":
                     raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
                 return raw
+        except urllib.error.HTTPError as exc:
+            last = exc
+            # Being rate-limited or refused is an answer, not a hiccup. Trying
+            # the same query twice more against the same limiter spends eighty
+            # seconds of a worker slot to be told the same thing, and deepens
+            # the throttle for every other query in the run.
+            if exc.code in (403, 429, 451):
+                time.sleep(1.5)
+                break
+            time.sleep(1.5 * (attempt + 1))
         except Exception as exc:                       # noqa: BLE001 — report, don't crash the run
             last = exc
             time.sleep(1.5 * (attempt + 1))
@@ -511,6 +550,9 @@ TOPICS = [
         ("post-government", ["employment", "restriction", "job"]),
     ]),
     ("registers", "Registers, disclosure and transparency", [
+        # Every kind of official list is called a register. This subject is the
+        # lobbying one, so the bare word needs the subject beside it — a
+        # ministry building a register of private tutors was reaching the wire.
         ("lobbying register", []), ("transparency register", []), ("lobby register", []),
         ("lobbying disclosure", []), ("disclosure regime", []),
         ("meeting logs", []), ("diary disclosure", []), ("ministerial meeting", ["disclosed", "logs", "records", "published"]),
@@ -564,7 +606,13 @@ TOPICS = [
         ("peak body", []), ("confederation of", ["industry", "business", "employers"]),
     ]),
     ("frontgroups", "Front groups and astroturf", [
-        ("front group", []), ("astroturf*", []), ("shell organisation", []), ("shell organization", []),
+        ("front group", []),
+        # "astroturf" is also a playing surface. A story about residents
+        # thanking a former district officer for an AstroTurf pitch was
+        # reaching the wire; the term now needs the political sense beside it.
+        ("astroturf*", ["campaign", "group", "lobby*", "funded", "donor*", "front",
+                        "backed by", "industry", "grassroots", "paid"]),
+        ("shell organisation", []), ("shell organization", []),
         ("grassroots campaign", ["funded", "industry", "backed", "fake"]),
         ("funded by", ["industry", "company", "tobacco", "fossil fuel", "undisclosed"]),
         ("dark money group", []), ("think tank", ["funded", "undisclosed", "industry", "donors"]),
@@ -730,6 +778,240 @@ DECIDED_C = _compile_all(DECIDED)
 INSTITUTIONAL_C = _compile_all(INSTITUTIONAL)
 MEASURED_C = _compile_all(MEASURED)
 PENDING_C = _compile_all(PENDING)
+# ------------------------------------------------------------------
+# The subjects, in the languages the queries now ask in.
+#
+# Localising one without the other makes things worse: localised
+# queries against English-only subjects fetch stories the gate then
+# refuses. These are the distinctive phrase from each locale's own
+# query, hand-picked — a mechanical rule produces stubs like Polish
+# "wplyw na" and Dutch "hoeveel geven", which is how a wire fills up
+# with the wrong thing.
+# ------------------------------------------------------------------
+LOCAL_TERMS = {
+    "agencies": [
+        ("captura del regulador", None), ("captura regulatória", None),
+        ("capture réglementaire", None), ("cattura del regolatore", None),
+        ("regulatorische vereinnahmung", None), ("захват регулятора", None),
+        ("السيطرة على الجهة التنظيمية", None), ("监管俘获", None),
+        ("監管俘獲", None), ("規制の虜", None),
+        ("규제 포획", None),
+    ],
+    "climate": [
+        ("fosil yakıt lobisi", None), ("fossiele lobby", None),
+        ("fossillobby", None), ("lobby de los combustibles fósiles", None),
+        ("lobby dei combustibili fossili", None), ("lobby der fossilen energien", None),
+        ("lobby des énergies fossiles", None), ("lobby dos combustíveis fósseis", None),
+        ("lobby paliw kopalnych", None), ("lobi energi fosil", None),
+        ("vận động hành lang nhiên liệu hóa thạch", None), ("λόμπι ορυκτών καυσίμων", None),
+        ("лобби ископаемого топлива", None), ("лобі викопного палива", None),
+        ("ضغط شركات الوقود الأحفوري", None), ("لابی سوخت‌های فسیلی", None),
+        ("जीवाश्म ईंधन लॉबी", None), ("জীবাশ্ম জ্বালানি লবি", None),
+        ("ล็อบบี้พลังงานฟอสซิล", None), ("የቅሪተ አካል ነዳጅ ሎቢ", None),
+        ("化石燃料 ロビー", None), ("化石燃料 游说", None),
+        ("화석연료 로비", None),
+    ],
+    "conflicts": [
+        ("belangenverstrengeling", None), ("cin karo da bukatu", None),
+        ("conflicto de intereses", None), ("conflit d'intérêts", None),
+        ("conflito de interesses", None), ("conflitto di interessi", None),
+        ("interessenkonflikt", None), ("intressekonflikt", None),
+        ("konflik kepentingan", None), ("konflikt interesów", None),
+        ("mgongano wa maslahi", None), ("xung đột lợi ích", None),
+        ("çıkar çatışması", None), ("σύγκρουση συμφερόντων", None),
+        ("конфликт интересов", None), ("конфлікт інтересів", None),
+        ("تضارب المصالح", None), ("تعارض منافع", None),
+        ("हितों का टकराव", None), ("স্বার্থের দ্বন্দ্ব", None),
+        ("ผลประโยชน์ทับซ้อน", None), ("የጥቅም ግጭት", None),
+        ("利益冲突", None), ("利益相反", None),
+        ("利益衝突", None), ("이해충돌", None),
+    ],
+    "drafting": [
+        ("legge scritta dalle lobby", None), ("legislación modelo", None),
+        ("ley redactada por la industria", None), ("loi rédigée par les lobbies", None),
+        ("mustergesetz", None), ("projeto de lei redigido pela indústria", None),
+        ("ustawa napisana przez branżę", None), ("wetsvoorstel geschreven door de industrie", None),
+        ("законопроект написан отраслью", None), ("业界起草", None),
+        ("法案 業界 起草", None),
+    ],
+    "finance": [
+        ("banka lobisi", None), ("bankenlobby", None),
+        ("banklobby", None), ("lobby bancaire", None),
+        ("lobby bancaria", None), ("lobby bancario", None),
+        ("lobby bancário", None), ("lobby bankowe", None),
+        ("lobi perbankan", None), ("vận động hành lang ngân hàng", None),
+        ("τραπεζικό λόμπι", None), ("банковское лобби", None),
+        ("банківське лобі", None), ("لابی بانکی", None),
+        ("لوبي البنوك", None), ("ล็อบบี้ธนาคาร", None),
+        ("銀行 ロビー", None), ("银行游说", None),
+        ("은행 로비", None),
+    ],
+    "frontgroups": [
+        ("dekmantelorganisatie", None), ("groupe écran", None),
+        ("grupo de fachada", None), ("gruppo di facciata", None),
+        ("kelompok bentukan", None), ("organizacja fasadowa", None),
+        ("paravan örgüt", None), ("tarnorganisation", None),
+        ("täckmantelorganisation", None), ("tổ chức bình phong", None),
+        ("οργάνωση βιτρίνα", None), ("подставная организация", None),
+        ("підставна організація", None), ("سازمان پوششی", None),
+        ("منظمة واجهة", None), ("मुखौटा संगठन", None),
+        ("องค์กรบังหน้า", None), ("幌子组织", None),
+        ("隠れ蓑団体", None), ("위장 단체", None),
+    ],
+    "health": [
+        ("farmalobby", None), ("ilaç lobisi", None),
+        ("lobby del tabaco", None), ("lobby farmaceutica", None),
+        ("lobby farmaceutyczne", None), ("lobby farmacéutico", None),
+        ("lobby farmacêutico", None), ("lobby pharmaceutique", None),
+        ("lobi farmasi", None), ("läkemedelslobby", None),
+        ("pharmalobby", None), ("tabakslobby", None),
+        ("vận động hành lang dược phẩm", None), ("φαρμακευτικό λόμπι", None),
+        ("фармлобби", None), ("фармлобі", None),
+        ("ضغط شركات الأدوية", None), ("لابی دارویی", None),
+        ("दवा कंपनी लॉबी", None), ("ওষুধ কোম্পানির লবি", None),
+        ("ล็อบบี้ยา", None), ("የመድኃኒት ኩባንያ ሎቢ", None),
+        ("医药游说", None), ("烟草业游说", None),
+        ("製薬 ロビー", None), ("醫藥遊說", None),
+        ("제약 로비", None),
+    ],
+    "registers": [
+        ("daftar pelobi", None), ("lobbyregister", None),
+        ("lobi kayıt sistemi", None), ("registo de lobby", None),
+        ("registro de lobbies", None), ("registro de lobby", None),
+        ("registro dei lobbisti", None), ("rejestr lobbystów", None),
+        ("répertoire des représentants d'intérêts", None), ("usajili wa washawishi", None),
+        ("μητρώο διαφάνειας", None), ("реестр лоббистов", None),
+        ("реєстр лобістів", None), ("ثبت لابی‌گران", None),
+        ("سجل جماعات الضغط", None), ("लॉबिस्ट पंजीकरण", None),
+        ("লবিস্ট নিবন্ধন", None), ("ทะเบียนผู้ล็อบบี้", None),
+        ("የሎቢስት ምዝገባ", None), ("ロビイスト登録", None),
+        ("游说登记", None), ("遊說登記", None),
+        ("로비스트 등록", None),
+    ],
+    "revolving": [
+        ("cửa xoay", None), ("draaideur", None),
+        ("drehtür", None), ("drzwi obrotowe", None),
+        ("döner kapı", None), ("pantouflage", None),
+        ("pintu putar", None), ("porta giratória", None),
+        ("porte girevoli", None), ("puertas giratorias", None),
+        ("svängdörr", None), ("περιστρεφόμενη πόρτα", None),
+        ("вращающаяся дверь", None), ("обертові двері", None),
+        ("الباب الدوار", None), ("درب گردان", None),
+        ("ঘূর্ণায়মান দরজা", None), ("ประตูหมุน", None),
+        ("回転ドア", None), ("天下り", None),
+        ("旋轉門", None), ("旋转门", None),
+        ("관피아", None), ("전관예우", None),
+    ],
+    "science": [
+        ("badania finansowane przez przemysł", None), ("door de industrie gefinancierd onderzoek", None),
+        ("estudio financiado por la industria", None), ("estudo financiado pela indústria", None),
+        ("industriefinanzierte studie", None), ("industrifinansierad forskning", None),
+        ("penelitian didanai industri", None), ("sanayi destekli araştırma", None),
+        ("studio finanziato dall'industria", None), ("étude financée par l'industrie", None),
+        ("исследование профинансировано отраслью", None), ("بحث ممول من الصناعة", None),
+        ("企业资助 研究", None), ("業界資金 研究", None),
+        ("업계 지원 연구", None),
+    ],
+    "shadow": [
+        ("kayıt dışı lobicilik", None), ("lobby en la sombra", None),
+        ("lobby no registrado", None), ("lobby não registado", None),
+        ("lobbying non déclaré", None), ("lobbying non registrato", None),
+        ("lobbying occulte", None), ("lobi tidak terdaftar", None),
+        ("nicht registrierte lobbyarbeit", None), ("niet-geregistreerde lobby", None),
+        ("niezarejestrowany lobbing", None), ("незарегистрированный лоббизм", None),
+        ("незареєстроване лобіювання", None), ("未登记 游说", None),
+        ("未登録 ロビー活動", None),
+    ],
+    "spending": [
+        ("belanja lobi", None), ("chi tiêu vận động hành lang", None),
+        ("despesas de lobby", None), ("dépenses de lobbying", None),
+        ("gasto en cabildeo", None), ("gasto en lobby", None),
+        ("gastos com lobby", None), ("lobbyausgaben", None),
+        ("lobbyuitgaven", None), ("lobbyutgifter", None),
+        ("lobi harcamaları", None), ("spesa per lobbying", None),
+        ("wydatki na lobbing", None), ("δαπάνες lobbying", None),
+        ("витрати на лобіювання", None), ("расходы на лоббирование", None),
+        ("إنفاق جماعات الضغط", None), ("هزینه لابی‌گری", None),
+        ("लॉबिंग पर खर्च", None), ("লবিং ব্যয়", None),
+        ("ค่าใช้จ่ายในการล็อบบี้", None), ("የሎቢ ወጪ", None),
+        ("ロビー活動 費用", None), ("游说支出", None),
+        ("遊說開支", None), ("로비 지출", None),
+    ],
+    "tech": [
+        ("ITロビー", None), ("lobbing big tech", None),
+        ("lobby das big tech", None), ("lobby delle big tech", None),
+        ("lobby tecnológico", None), ("lobbying des géants du numérique", None),
+        ("lobi perusahaan teknologi", None), ("tech-lobby", None),
+        ("techlobby", None), ("teknoloji lobisi", None),
+        ("лоббизм технологических компаний", None), ("ضغط شركات التكنولوجيا", None),
+        ("科技巨头 游说", None), ("빅테크 로비", None),
+    ],
+    "tradeassoc": [
+        ("associazione di categoria", None), ("associação setorial", None),
+        ("branchenverband", None), ("brancheorganisatie", None),
+        ("fédération professionnelle", None), ("organizacja branżowa", None),
+        ("patronal presiona", None), ("wirtschaftsverband", None),
+        ("отраслевая ассоциация", None),
+    ],
+}
+
+for _tid, _label, _terms in TOPICS:
+    _terms.extend(LOCAL_TERMS.get(_tid, []))
+
+# ------------------------------------------------------------------
+# Subjects this wire had a name for and never asked about.
+#
+# The terms below were already here and were well written; what was
+# missing was any query aimed at them, so they held zero stories
+# however much the world published. These are the phrases from the
+# queries now added, so what is fetched can be filed.
+# ------------------------------------------------------------------
+FILL_TERMS = {
+    "foreign": [
+        ("contrat de lobbying", None), ("contrato de lobby", None),
+        ("contratto di lobbying", None), ("enregistrement des agents", None),
+        ("lobbyvertrag ausländische regierung", None), ("registo de agentes", None),
+        ("registrierung ausländischer agenten", None), ("registro de agentes", None),
+        ("registro degli agenti", None), ("контракт на лоббизм", None),
+        ("реестр иностранных агентов", None), ("外国代理人 登记 游说", None),
+        ("外国代理人 登録 ロビー", None), ("外国政府 ロビー契約", None),
+        ("外国政府 游说 合同", None), ("외국 대리인 등록", None),
+        ("외국 정부 로비", None),
+    ],
+    "subnational": [
+        ("kommunales lobbyregister", None), ("lobby autonómico gasto", None),
+        ("lobby en ayuntamientos", None), ("lobby nas câmaras", None),
+        ("lobby regional gastos", None), ("lobbyarbeit auf landesebene", None),
+        ("lobbying en collectivité", None), ("lobbying local dépenses", None),
+        ("lobbying regionale spesa", None), ("lobbyismus im rathaus", None),
+        ("registo municipal de", None), ("registre des lobbies", None),
+        ("registro comunale dei", None), ("registro municipal de", None),
+        ("地方政府 游说 支出", None), ("地方自治体 ロビー活動", None),
+        ("市政 游说 登记", None), ("自治体 陳情 開示", None),
+        ("지방정부 로비 지출", None), ("지자체 로비 공개", None),
+    ],
+}
+
+for _tid, _label, _terms in TOPICS:
+    _terms.extend(FILL_TERMS.get(_tid, []))
+
+
+# --------------------------------------------------------------------------
+# The same subjects in the languages this wire's own queries ask in, derived
+# from those queries and filed under the subject each query's label names. The
+# gate above was written in English; the queries were translated and it was
+# not, so three quarters of what the wire fetched could not be recognised once
+# it arrived. Generated — edit topics_multilingual.json, or delete the file to
+# turn this off.
+# --------------------------------------------------------------------------
+_EXTRA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "topics_multilingual.json")
+if os.path.exists(_EXTRA_PATH):
+    with open(_EXTRA_PATH, encoding="utf-8") as _fh:
+        _EXTRA = json.load(_fh)
+    TOPICS = [(tid, label, terms + [(t, g) for t, g in _EXTRA.get(tid, [])])
+              for tid, label, terms in TOPICS]
+
 TOPICS_C = [(tid, label, [(_compile(t), _compile_all(g) if g else None) for t, g in terms])
             for tid, label, terms in TOPICS]
 GEO3_C = [(rid, rlabel, [(sid, slabel, [(pid, plabel, _compile_all(terms))
@@ -1318,19 +1600,91 @@ def scene_first(text, places):
         (scene if _is_scene(text, _first_pos(text, terms.get(pid, []))) else rest).append(pid)
     return scene + rest
 
-def point_for(text, places, subs, regions):
-    """The most specific point a story resolved to: a named sub-national place
-    if there is one, otherwise the country, otherwise the subregion or region.
-    Returns (label_or_None, point_or_None)."""
+
+# --------------------------------------------------------------------------
+# The gazetteer answers with a country; this wire's taxonomy is keyed on ids
+# whose leading token is that country's ISO-2. Filing a placed story under its
+# region is therefore a lookup, not a guess. Where a country is split across
+# several places, only region and subregion are filled: which of the places a
+# story belongs to is a question the country code cannot answer.
+# --------------------------------------------------------------------------
+ISO_REGION = {}
+for _rid, _rlabel, _subs in GEO3:
+    for _sid, _slabel, _places in _subs:
+        for _pid, _plabel, _terms in _places:
+            _iso = _pid.split("-")[0].lower()
+            if len(_iso) == 2:
+                ISO_REGION.setdefault(_iso, (_rid, _sid))
+
+
+def file_by_country(row, cc):
+    """Put a gazetteer-placed story in its region, if the wire has one."""
+    if not cc:
+        return
+    hit = ISO_REGION.get(str(cc).lower())
+    if not hit:
+        return
+    rid, sid = hit
+    if not row.get("w") or row["w"] == ["unlocated"]:
+        row["w"] = [rid]
+    if not row.get("sr") or row["sr"] == ["unlocated"]:
+        row["sr"] = [sid]
+
+
+
+def country_for(raw, locale=None):
+    """The ISO-2 the placement resolved to, or None."""
+    if not _GAZETTEER:
+        return None
+    try:
+        return galaxy_places.resolve_full(raw, locale)[4]
+    except Exception:
+        return None
+
+
+def point_for(text, places, subs, regions, locale=None, raw=None):
+    """The most specific point a story resolved to.
+
+    The order is deliberate. This wire's own curated table goes first: it holds
+    the places this subject actually turns up and the country list it was
+    written against, and it beats a general gazetteer on its own ground. The
+    shared gazetteer follows but only overrides at the settlement level, so a
+    headline naming Kharkiv pins on Kharkiv rather than the middle of Ukraine,
+    while a country reading from this wire's own table still wins over a
+    country reading from the gazetteer. Then the bodies that stand for a
+    jurisdiction without naming it — EFSA is a European story, ANVISA a
+    Brazilian one. Last, and weakest, the country the source itself reports
+    from.
+
+    Returns (label_or_None, point_or_None, approx). approx is True only for
+    that last case, where nothing in the story placed it and the point is the
+    reporting locale rather than the scene. The page draws those hollow.
+    """
     label, point = precise_for(text)
     if point:
-        return label, point
+        return label, point, False
+
+    glabel, gpoint, grank = None, None, -1
+    if _GAZETTEER:
+        glabel, gpoint, grank, _approx = galaxy_places.resolve_ranked(raw or text)
+        if grank == 3:
+            return glabel, gpoint, False
+
     places = scene_first(text, places)
     for level in (places, subs, regions):
         for pid in level:
             if pid in COORDS:
-                return None, COORDS[pid]
-    return None, None
+                return None, COORDS[pid], False
+
+    if gpoint:
+        return glabel, gpoint, False
+
+    if _GAZETTEER and locale:
+        llabel, lpoint, _lrank, lapprox = galaxy_places.resolve_ranked("", locale)
+        if lpoint:
+            return llabel, lpoint, lapprox
+
+    return None, None, False
 
 
 def load_sources():
@@ -1344,12 +1698,15 @@ def load_sources():
         for loc in cfg.get(block, []):
             srcs.append({"name": prefix + loc["label"], "lang": loc["lang"],
                          "standing": loc["standing"], "region": loc["standing"],
-                         "kind": "news", "url": build_gnews_url(loc)})
+                         "kind": "news", "url": build_gnews_url(loc), "gl": loc.get("gl")})
     return srcs, cfg
 
 
 def run(dry_run=False, fixtures=None):
+    global DEADLINE
     sources, cfg = load_sources()
+    if not fixtures:
+        DEADLINE = time.monotonic() + READ_BUDGET_MIN * 60
     print("Reading %d wires…" % len(sources))
 
     def read(src):
@@ -1409,7 +1766,12 @@ def run(dry_run=False, fixtures=None):
                 row["w"] = regions
                 row["sr"] = subs
                 row["pl"] = places
-                row["pn"], row["ll"] = point_for(text, places, subs, regions)
+                row["gl"] = src.get("gl")
+                _raw = (row["t"] or "") + " " + (row.get("s") or "")
+                row["pn"], row["ll"], row["pa"] = point_for(
+                    text, places, subs, regions, src.get("gl"), _raw)
+                if row["ll"]:
+                    file_by_country(row, country_for(_raw, src.get("gl")))
                 row["p"] = total
                 row["y"] = reasons
                 row["st"] = src["standing"]
@@ -1422,8 +1784,23 @@ def run(dry_run=False, fixtures=None):
 
     fresh_urls = {canon_url(i["u"]) for i in items}
     for row in previous:
-        if "x" in row:
-            absorb(row)
+        if "x" not in row:
+            continue
+        # A retained story is placed again rather than carried forward with the
+        # answer it happened to get the day it was first read. RETAIN_DAYS is
+        # 45, so without this a change to the placement layer takes a month and
+        # a half to reach the map, and a story never re-fetched keeps its first
+        # answer for good. Rows already holding a point resolved from their own
+        # text are left alone; only the unplaced and the source-country
+        # approximations are reconsidered.
+        if not row.get("ll") or row.get("pa"):
+            _raw = ((row.get("t") or "") + " " + (row.get("s") or ""))
+            row["pn"], row["ll"], row["pa"] = point_for(
+                _raw.lower(), row.get("pl") or [], row.get("sr") or [],
+                row.get("w") or [], row.get("gl"), _raw)
+            if row["ll"]:
+                file_by_country(row, country_for(_raw, row.get("gl")))
+        absorb(row)
 
     cutoff = int(time.time() * 1000) - RETAIN_DAYS * 86400000
     items = [i for i in items if (i.get("d") or cutoff + 1) >= cutoff]
